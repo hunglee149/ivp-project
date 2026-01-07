@@ -1,0 +1,8 @@
+numpy
+opencv-python
+matplotlib
+torch
+torchvision
+kornia
+kornia-rs
+git+https://github.com/cvg/LightGlue.git#egg=lightglue
