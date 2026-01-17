@@ -15,7 +15,6 @@ class FeatureMatcher:
         self.device = device
         self.max_image_size = max_image_size
         
-        print(f"Khoi tao SuperPoint & LightGlue tren {device}...")
         self.extractor = SuperPoint(max_num_keypoints=max_num_keypoints).eval().to(device)
         self.matcher = LightGlue(features='superpoint').eval().to(device)
 
@@ -47,7 +46,7 @@ class FeatureMatcher:
             
         return feats0, feats1, matches01
 
-    def match_images(self, image_path0: str, image_path1: str):
+    def match_images(self, image_path0: str, image_path1: str, filter_black=True):
         image0, scale0 = self.load_image(image_path0)
         image1, scale1 = self.load_image(image_path1)
         
@@ -60,5 +59,24 @@ class FeatureMatcher:
         
         points0 = points0 / scale0
         points1 = points1 / scale1
+        
+        if filter_black:
+            img0_cv = cv2.imread(image_path0, cv2.IMREAD_GRAYSCALE)
+            img1_cv = cv2.imread(image_path1, cv2.IMREAD_GRAYSCALE)
+            
+            valid_mask = np.ones(len(points0), dtype=bool)
+            
+            for idx, (p0, p1) in enumerate(zip(points0, points1)):
+                x0, y0 = int(p0[0]), int(p0[1])
+                x1, y1 = int(p1[0]), int(p1[1])
+                
+                if (0 <= y0 < img0_cv.shape[0] and 0 <= x0 < img0_cv.shape[1] and
+                    0 <= y1 < img1_cv.shape[0] and 0 <= x1 < img1_cv.shape[1]):
+                    if img0_cv[y0, x0] < 10 or img1_cv[y1, x1] < 10:
+                        valid_mask[idx] = False
+            
+            points0 = points0[valid_mask]
+            points1 = points1[valid_mask]
+            
         
         return points0, points1

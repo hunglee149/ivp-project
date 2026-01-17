@@ -3,8 +3,34 @@ import cv2
 from typing import Tuple, Optional
 
 class ImageStitcher:
-    def __init__(self):
-        pass
+    def __init__(self, focal_length=None):
+        self.focal_length = focal_length
+
+    # phep chieu tru
+    def cylindrical_projection(self, img: np.ndarray, focal_length=None) -> np.ndarray:
+        if focal_length is None:
+            focal_length = self.focal_length
+        if focal_length is None:
+            h, w = img.shape[:2]
+            focal_length = (w + h) / 2
+        
+        h, w = img.shape[:2]
+        
+        y_coords, x_coords = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+        
+        theta = (x_coords - w/2) / focal_length
+        h_val = (y_coords - h/2) / focal_length
+        
+        X = np.sin(theta)
+        Y = h_val
+        Z = np.cos(theta)
+        
+        x_proj = (focal_length * X / Z + w/2).astype(np.float32)
+        y_proj = (focal_length * Y / Z + h/2).astype(np.float32)
+        
+        cylindrical = cv2.remap(img, x_proj, y_proj, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        
+        return cylindrical
 
     def normalize_points(self, pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         centroid = np.mean(pts, axis=0)
@@ -27,10 +53,10 @@ class ImageStitcher:
 
     def compute_dlt(self, src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
         if len(src_pts) < 4:
-            raise ValueError("Cần ít nhất 4 cặp điểm để tính homography")
+            raise ValueError("Can it nhat 4 cap diem de tinh homography.")
         
         if len(src_pts) != len(dst_pts):
-            raise ValueError("Số điểm nguồn và đích phải bằng nhau")
+            raise ValueError("So diem nguon va dich phai bang nhau.")
         
         src_norm, T_src = self.normalize_points(src_pts)
         dst_norm, T_dst = self.normalize_points(dst_pts)
@@ -49,17 +75,17 @@ class ImageStitcher:
             H_norm = Vh[-1].reshape(3, 3)
             
             if abs(H_norm[2, 2]) < 1e-8:
-                raise ValueError("Homography suy biến (H[2,2] ≈ 0) - có thể do điểm thẳng hàng hoặc nhiễu lớn")
+                raise ValueError("Homography suy bien (H[2,2] xap xi 0) - co the do diem thang hang hoac nhieu lop.")
             
             H_norm = H_norm / H_norm[2, 2]
             H = np.linalg.inv(T_dst) @ H_norm @ T_src
             H = H / H[2, 2]
             return H
         except np.linalg.LinAlgError as e:
-            raise RuntimeError(f"Không thể tính SVD: {str(e)}")
+            raise RuntimeError(f"Khong the tinh SVD: {str(e)}")
 
     def _ransac_homography(self, src_pts: np.ndarray, dst_pts: np.ndarray, 
-                          ransac_threshold: float = 3.0, max_iters: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
+                          ransac_threshold: float = 2.0, max_iters: int = 5000) -> Tuple[np.ndarray, np.ndarray]:
         N = len(src_pts)
         if N < 4:
             return np.eye(3), np.zeros(N, dtype=bool)
@@ -101,8 +127,6 @@ class ImageStitcher:
                 
                 if num_inliers > 0.95 * N:
                     break
-
-        print(f"RANSAC: {max_inliers}/{N} inliers ({max_inliers/N*100:.1f}%)")
         
         if best_H is not None and max_inliers > 4:
             refined_H = self.compute_dlt(src_pts[best_mask], dst_pts[best_mask])
@@ -113,116 +137,90 @@ class ImageStitcher:
             
         return best_H, best_mask
 
-    def _linear_blend(self, img1: np.ndarray, img2: np.ndarray, max_size=3072) -> np.ndarray:
+    def _create_soft_weights(self, img1: np.ndarray, img2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
+        
+        mask1 = (gray1 > 0).astype(np.uint8)
+        mask2 = (gray2 > 0).astype(np.uint8)
+        
+        dist1 = cv2.distanceTransform(mask1, cv2.DIST_L2, 5).astype(np.float32)
+        dist2 = cv2.distanceTransform(mask2, cv2.DIST_L2, 5).astype(np.float32)
+        
+        sum_dist = dist1 + dist2
+        sum_dist[sum_dist == 0] = 1.0
+        
+        weight1 = dist1 / sum_dist
+        weight2 = dist2 / sum_dist
+        
+        return weight1, weight2
+
+    def _blend_core(self, img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
         h, w = img1.shape[:2]
         
-        if max(h, w) > max_size:
-            try:
-                scale = max_size / max(h, w)
-                new_h, new_w = int(h * scale), int(w * scale)
-                
-                img1_small = cv2.resize(img1, (new_w, new_h))
-                img2_small = cv2.resize(img2, (new_w, new_h))
-                
-                blended_small = self._blend_core(img1_small, img2_small)
-                
-                blended = cv2.resize(blended_small, (w, h))
-                return blended
-            except (MemoryError, cv2.error, np.core._exceptions._ArrayMemoryError):
-                mask2_any = (img2.sum(axis=2) > 0)
-                result = img1.copy()
-                result[mask2_any] = img2[mask2_any]
-                return result
-        else:
-            return self._blend_core(img1, img2)
-    
-    def _blend_core(self, img1: np.ndarray, img2: np.ndarray) -> np.ndarray:
-        try:
-            gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
-            gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
-            
-            mask1 = (gray1 > 0).astype(np.uint8)
-            mask2 = (gray2 > 0).astype(np.uint8)
-            overlap = mask1 & mask2
-            
-            if not overlap.any():
-                return np.where(mask1[:,:,None] > 0, img1, img2)
-            
-            dist1 = cv2.distanceTransform(mask1, cv2.DIST_L2, 5)
-            dist2 = cv2.distanceTransform(mask2, cv2.DIST_L2, 5)
-            
-            weight1 = dist1 / (dist1 + dist2 + 1e-10)
-            weight2 = 1 - weight1
-            
-            result = np.zeros_like(img1, dtype=np.float32)
-            for c in range(3):
-                result[:,:,c] = img1[:,:,c] * weight1 + img2[:,:,c] * weight2
-            
-            return result.astype(np.uint8)
-        except (MemoryError, np.core._exceptions._ArrayMemoryError):
-            mask2_any = (img2.sum(axis=2) > 0)
-            result = img1.copy()
-            result[mask2_any] = img2[mask2_any]
-            return result
+        w1, w2 = self._create_soft_weights(img1, img2)
+        
+        w1 = w1[:, :, np.newaxis]
+        w2 = w2[:, :, np.newaxis]
+        
+        img1_float = img1.astype(np.float32)
+        img2_float = img2.astype(np.float32)
+        
+        result = (img1_float * w1 + img2_float * w2)
+        
+        return np.clip(result, 0, 255).astype(np.uint8)
 
     def stitch(self, img1: np.ndarray, img2: np.ndarray, 
                pts1: np.ndarray, pts2: np.ndarray,
                use_ransac: bool = True,
                ransac_threshold: float = 3.0,
-               use_blending: bool = True) -> np.ndarray:
+               use_blending: bool = True,
+               use_cylindrical: bool = False,
+               focal_length: float = None) -> np.ndarray:
         
         if len(pts1) < 4:
-            raise ValueError("Cần ít nhất 4 cặp điểm khớp")
+            raise ValueError("Can it nhat 4 cap diem khop.")
+        
+        if use_cylindrical:
+            img1 = self.cylindrical_projection(img1, focal_length)
+            img2 = self.cylindrical_projection(img2, focal_length)
         
         if use_ransac:
             H, _ = self._ransac_homography(pts1, pts2, ransac_threshold)
         else:
             H = self.compute_dlt(pts1, pts2)
         
-        det = np.linalg.det(H[:2, :2])
-        if abs(det) < 1e-6:
-            raise ValueError(f"Homography không hợp lệ (det={det:.2e})")
+        if np.abs(np.linalg.det(H)) < 1e-8:
+            return img1
         
         h1, w1 = img1.shape[:2]
         h2, w2 = img2.shape[:2]
         
-        corners = np.array([[0, 0], [0, h1-1], [w1-1, h1-1], [w1-1, 0]], dtype=np.float32).reshape(-1, 1, 2)
-        warped_corners = cv2.perspectiveTransform(corners, H)
+        corners_1 = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+        corners_1_warped = cv2.perspectiveTransform(corners_1, H)
         
-        all_corners = np.concatenate((warped_corners, 
-                                      np.array([[0, 0], [0, h2-1], [w2-1, h2-1], [w2-1, 0]], dtype=np.float32).reshape(-1, 1, 2)))
+        corners_2 = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
         
-        xmin, ymin = np.int32(all_corners.min(axis=0).ravel() - 0.5)
-        xmax, ymax = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+        all_corners = np.concatenate((corners_1_warped, corners_2), axis=0)
         
-        width = xmax - xmin
-        height = ymax - ymin
+        [xmin, ymin] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
+        [xmax, ymax] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
         
-        shift = np.array([[1, 0, -xmin], [0, 1, -ymin], [0, 0, 1]], dtype=np.float64)
-        H_final = shift @ H
+        translation = [-xmin, -ymin]
+        H_translation = np.array([[1, 0, translation[0]], [0, 1, translation[1]], [0, 0, 1]])
         
-        result = cv2.warpPerspective(img1, H_final, (width, height))
+        output_h, output_w = ymax - ymin, xmax - xmin
         
-        y_start = -ymin
-        x_start = -xmin
-        y_end = y_start + h2
-        x_end = x_start + w2
+        img1_warped = cv2.warpPerspective(img1, H_translation @ H, (output_w, output_h))
         
-        result_y1 = max(0, y_start)
-        result_x1 = max(0, x_start)
-        result_y2 = min(height, y_end)
-        result_x2 = min(width, x_end)
-        
-        img2_y1 = result_y1 - y_start
-        img2_x1 = result_x1 - x_start
-        img2_y2 = img2_y1 + (result_y2 - result_y1)
-        img2_x2 = img2_x1 + (result_x2 - result_x1)
+        img2_canvas = np.zeros_like(img1_warped)
+        y_start, x_start = translation[1], translation[0]
+        img2_canvas[y_start:y_start+h2, x_start:x_start+w2] = img2
         
         if use_blending:
-            canvas = np.zeros_like(result)
-            canvas[result_y1:result_y2, result_x1:result_x2] = img2[img2_y1:img2_y2, img2_x1:img2_x2]
-            result = self._linear_blend(result, canvas)
+            result = self._blend_core(img1_warped, img2_canvas)
         else:
-            result[result_y1:result_y2, result_x1:result_x2] = img2[img2_y1:img2_y2, img2_x1:img2_x2]
+            result = img1_warped.copy()
+            result[y_start:y_start+h2, x_start:x_start+w2] = img2
         
         return result
