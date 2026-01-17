@@ -79,7 +79,9 @@ def main():
         extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
         image_paths = []
         for ext in extensions:
-            image_paths.extend(sorted(folder.glob(ext)))
+            image_paths.extend(folder.glob(ext))
+        
+        image_paths = sorted(list(set(image_paths)))
         
         if len(image_paths) < 2:
             print(f"Loi: Chi tim thay {len(image_paths)} anh trong folder")
